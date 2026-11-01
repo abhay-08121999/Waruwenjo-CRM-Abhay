@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchB2BLeads, createB2BLead, sendCrmEmail, supabase } from '../services/supabase.ts';
+import { fetchB2BLeads, createB2BLead, sendCrmEmail, uploadSignedMou, uploadSignedConsentLetter, getSignedMouUrl, saveMedicalLeadSignedDocumentPath } from '../services/supabase.ts';
 import * as XLSX from 'xlsx';
 import { LeadStatus } from '../types.ts';
 import { 
@@ -444,18 +444,18 @@ const Leads: React.FC = () => {
         relationshipOwner: qualification.owner || lead.owner_name || '', lifecycle: 'Onboarding',
         performanceNotes: '', qualityIssues: '', contactChanges: '', contractExpiryDate: stage3.expiryDate || '', renewalReminderDate: '',
         legalEntityChange: false, bankDetailsChange: false, termsChange: false, changeReviewApproved: false,
-        activatedAt: '', auditHistory: [], lastSavedAt: '',
+        activatedAt: '', auditHistory: [], lastSavedAt: '', signedMouPath: '', signedConsentPath: '',
       };
       try { return { ...defaults, ...(JSON.parse(localStorage.getItem(stage4StorageKey) || '{}')) }; }
       catch { return defaults; }
     };
     const [stage4, setStage4] = useState<any>(() => readStage4());
+    const [uploadingStage4Document, setUploadingStage4Document] = useState<'MOU' | 'CONSENT' | null>(null);
     const [showMoUPreview, setShowMoUPreview] = useState(false);
     const [showConsentLetter, setShowConsentLetter] = useState(false);
     const [activityType, setActivityType] = useState('Email');
     const [negotiationNote, setNegotiationNote] = useState('');
     const [sendingMoU, setSendingMoU] = useState(false);
-    const [uploadingStage4Doc, setUploadingStage4Doc] = useState<'signedMouFile' | 'signedConsentFile' | null>(null);
     const saveStage3 = (updates: Record<string, any>, message?: string) => {
       setStage3((current: any) => {
         const next = { ...current, ...updates, lastSavedAt: new Date().toISOString() };
@@ -479,58 +479,41 @@ const Leads: React.FC = () => {
       const sensitive = ['legalEntityChange','bankDetailsChange','termsChange'];
       saveStage4({ [field]: value, ...(sensitive.includes(field) || ['legalName','contractExpiryDate'].includes(field) ? { changeReviewApproved: false } : {}) });
     };
-    const uploadStage4Document = async (kind: 'signedMouFile' | 'signedConsentFile', file?: File | null) => {
+    const uploadStage4SignedDocument = async (kind: 'MOU' | 'CONSENT', file?: File) => {
       if (!file) return;
-      const allowedTypes = ['application/pdf', 'image/png', 'image/jpeg'];
-      const extension = file.name.split('.').pop()?.toLowerCase();
-      if (!allowedTypes.includes(file.type) && !['pdf', 'png', 'jpg', 'jpeg'].includes(extension || '')) {
-        toast.error('Upload a signed MOU or consent as PDF, JPG, or PNG.');
-        return;
-      }
-      if (file.size > 15 * 1024 * 1024) {
-        toast.error('The file must be 15 MB or smaller.');
-        return;
-      }
-      setUploadingStage4Doc(kind);
+      if (!String(lead.id || '').trim()) { toast.error('Original lead ID is missing.'); return; }
+      setUploadingStage4Document(kind);
       try {
-        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const documentType = kind === 'signedMouFile' ? 'signed-mou' : 'signed-consent';
-        const path = `medical-leads/${String(lead.id)}/${documentType}/${Date.now()}-${safeName}`;
-        const { error } = await supabase.storage.from('agreements').upload(path, file, {
-          cacheControl: '3600',
-          upsert: false,
-          contentType: file.type || undefined,
-        });
-        if (error) throw error;
-        const documentRecord = {
-          path,
-          fileName: file.name,
-          contentType: file.type || 'application/octet-stream',
-          size: file.size,
-          uploadedAt: new Date().toISOString(),
-          sourceLeadId: String(lead.id),
-        };
-        saveStage4({ [kind]: documentRecord }, kind === 'signedMouFile' ? 'Signed MOU uploaded to Agreement Storage.' : 'Signed consent uploaded to Agreement Storage.');
-      } catch (error: any) {
-        console.error('[Medical Leads] Stage 4 document upload failed:', error);
-        toast.error(`Upload failed: ${error?.message || 'Check that the agreements storage bucket exists and your account has upload permission.'}`);
-      } finally {
-        setUploadingStage4Doc(null);
-      }
-    };
-    const openStage4Document = async (kind: 'signedMouFile' | 'signedConsentFile') => {
-      const record = stage4[kind];
-      if (!record?.path) { toast.error('No uploaded document is recorded yet.'); return; }
-      try {
-        const { data, error } = await supabase.storage.from('agreements').createSignedUrl(record.path, 60);
-        if (error) throw error;
-        if (data?.signedUrl) window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
-        else throw new Error('Could not create a secure document link.');
-      } catch (error: any) {
-        toast.error(`Could not open document: ${error?.message || 'Storage access failed.'}`);
-      }
-    };
+        const result = kind === 'MOU'
+          ? await uploadSignedMou(String(lead.id), file, stage4.legalName || lead.company_name || lead.full_name || 'partner')
+          : await uploadSignedConsentLetter(String(lead.id), file, stage4.legalName || lead.company_name || lead.full_name || 'partner');
+        if (result.error || !result.filePath) throw result.error || new Error('Supabase Storage did not return a file path.');
 
+        // Save the Storage path in the originating medical_leads database row.
+        const dbResult = await saveMedicalLeadSignedDocumentPath(String(lead.id), kind, result.filePath);
+        if (dbResult.error) {
+          console.error(`[Stage 4] PDF uploaded, but database path save failed for ${kind}:`, dbResult.error);
+          toast.error(`PDF uploaded to Storage, but its path could not be saved to medical_leads: ${dbResult.error.message}. Run the Stage 4 SQL update and check the table's UPDATE policy.`);
+        }
+
+        const field = kind === 'MOU' ? 'signedMouPath' : 'signedConsentPath';
+        saveStage4({ [field]: result.filePath }, dbResult.error
+          ? `Signed ${kind} uploaded to Storage; database path save needs attention.`
+          : `Signed ${kind === 'MOU' ? 'MOU' : 'Consent Letter'} uploaded and saved.`);
+        if (!dbResult.error) toast.success('Document uploaded and linked to this medical lead.');
+      } catch (error: any) {
+        console.error(`[Stage 4] Signed ${kind} upload failed:`, error);
+        toast.error(error?.message || `Could not upload signed ${kind === 'MOU' ? 'MOU' : 'Consent Letter'}. Check the signedmou bucket and its Storage policies.`);
+      } finally {
+        setUploadingStage4Document(null);
+      }
+    };
+    const openStage4SignedDocument = async (filePath: string) => {
+      if (!filePath) return;
+      const { data, error } = await getSignedMouUrl(filePath);
+      if (error || !data) { toast.error(error?.message || 'Could not create a secure document link.'); return; }
+      window.open(data, '_blank', 'noopener,noreferrer');
+    };
     const activatePartner = () => {
       if (!(stage3.finalApproval && stage3.finalSignatureConfirmed && stage3.partnerSignatureName?.trim() && stage3.organisationSignatureName?.trim() && stage3.partnerSignedDate && stage3.organisationSignedDate && stage3.effectiveDate)) {
         toast.error('Stage 3 approval and both parties’ signature details must be complete before activation.'); return;
@@ -792,8 +775,16 @@ const Leads: React.FC = () => {
         )}
         {activeStage === 4 && !archiveState.archived && (
           <section className="bg-white border border-slate-200 rounded-[2rem] p-5 md:p-7 shadow-sm space-y-7">
-            <div><p className="text-[10px] font-black uppercase tracking-widest text-indigo-600">Stage 4 · Operations / BDM</p><h3 className="text-xl font-black text-slate-900 mt-1">Activate & Manage Partner</h3><p className="text-sm text-slate-500 mt-1">Create or update the partner master record, preserve the original lead ID, and maintain lifecycle, service coverage, quality and renewal information. Records are stored in this browser until database integration is added.</p></div>
+            <div><p className="text-[10px] font-black uppercase tracking-widest text-indigo-600">Stage 4 · Operations / BDM</p><h3 className="text-xl font-black text-slate-900 mt-1">Activate & Manage Partner</h3><p className="text-sm text-slate-500 mt-1">Create or update the partner master record, preserve the original lead ID, and maintain lifecycle, service coverage, quality and renewal information. Signed document paths are linked to the medical lead in Supabase.</p></div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3"><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">Original Lead ID</p><p className="mt-1 text-sm font-bold break-all">{String(lead.id)}</p></div><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">MoU Version</p><p className="mt-1 text-sm font-bold">{stage3.templateVersion || 'Not recorded'}</p></div><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">Lifecycle</p><p className="mt-1 text-sm font-bold">{stage4.lifecycle}</p></div></div>
+            <div className="rounded-2xl border border-indigo-200 bg-indigo-50 p-5 space-y-4">
+              <div><h4 className="font-black text-indigo-950">Signed document repository</h4><p className="mt-1 text-sm text-indigo-800">Upload the final, fully signed PDF copies. Both documents are stored privately in the Supabase <strong>signedmou</strong> bucket under this lead ID.</p></div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="rounded-xl border border-indigo-100 bg-white p-4 space-y-3"><div><p className="text-sm font-black text-slate-900">Signed copy of MOU</p><p className="text-xs text-slate-500 mt-1">PDF only · maximum 20 MB</p></div><label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-bold text-white hover:bg-indigo-700"><Upload size={16}/> {uploadingStage4Document === 'MOU' ? 'Uploading MOU…' : 'Upload signed copy of MOU'}<input disabled={uploadingStage4Document !== null} type="file" accept="application/pdf,.pdf" className="hidden" onChange={e=>{void uploadStage4SignedDocument('MOU',e.target.files?.[0]);e.currentTarget.value='';}}/></label>{stage4.signedMouPath ? <div className="flex flex-wrap items-center gap-3"><span className="text-xs font-semibold text-emerald-700">Signed MOU uploaded</span><button type="button" onClick={()=>void openStage4SignedDocument(stage4.signedMouPath)} className="text-xs font-bold text-indigo-700 underline">View / Download</button></div> : <p className="text-xs text-amber-700">No signed MOU uploaded yet.</p>}</div>
+                <div className="rounded-xl border border-indigo-100 bg-white p-4 space-y-3"><div><p className="text-sm font-black text-slate-900">Signed copy of Consent Letter</p><p className="text-xs text-slate-500 mt-1">PDF only · maximum 20 MB</p></div><label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white hover:bg-emerald-700"><Upload size={16}/> {uploadingStage4Document === 'CONSENT' ? 'Uploading consent letter…' : 'Upload signed copy of consent letter'}<input disabled={uploadingStage4Document !== null} type="file" accept="application/pdf,.pdf" className="hidden" onChange={e=>{void uploadStage4SignedDocument('CONSENT',e.target.files?.[0]);e.currentTarget.value='';}}/></label>{stage4.signedConsentPath ? <div className="flex flex-wrap items-center gap-3"><span className="text-xs font-semibold text-emerald-700">Signed Consent Letter uploaded</span><button type="button" onClick={()=>void openStage4SignedDocument(stage4.signedConsentPath)} className="text-xs font-bold text-indigo-700 underline">View / Download</button></div> : <p className="text-xs text-amber-700">No signed Consent Letter uploaded yet.</p>}</div>
+              </div>
+              <p className="text-xs text-indigo-800">The PDFs are stored privately in Supabase Storage. Their file paths are also saved on the originating medical_leads database record and in this browser's Stage 4 record.</p>
+            </div>
             <div className="space-y-4"><h4 className="font-black text-slate-900">Feature 10 · Activate partner and create/update master record</h4><div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <label className="block"><span className="text-xs font-bold text-slate-500">Partner type *</span><select value={stage4.partnerType} onChange={e=>updateStage4Field('partnerType',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm">{['Doctor','Hospital','Visa Facilitator','Nursing Facilitator','Travel Partner','Clinic','Medical Agency','Other'].map(v=><option key={v} value={v}>{v}</option>)}</select></label>
               <label className="block"><span className="text-xs font-bold text-slate-500">Legal / master record name *</span><input value={stage4.legalName} onChange={e=>updateStage4Field('legalName',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm" placeholder="Registered legal entity name"/></label>
@@ -804,16 +795,7 @@ const Leads: React.FC = () => {
               <label className="block"><span className="text-xs font-bold text-slate-500">Primary phone</span><input value={stage4.primaryPhone} onChange={e=>updateStage4Field('primaryPhone',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm"/></label>
               <label className="block"><span className="text-xs font-bold text-slate-500">Service area *</span><input value={stage4.serviceArea} onChange={e=>updateStage4Field('serviceArea',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm" placeholder="City, region, country or coverage area"/></label>
               <label className="block md:col-span-2"><span className="text-xs font-bold text-slate-500">Capabilities / services *</span><textarea rows={3} value={stage4.capabilities} onChange={e=>updateStage4Field('capabilities',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm" placeholder="Services offered, specialties, capacity, operating hours, supported patient needs…"/></label>
-            </div>
-            <div className="mt-6 rounded-2xl border border-blue-200 bg-blue-50/60 p-5 space-y-4">
-              <div><h4 className="font-black text-slate-900">Signed documents</h4><p className="mt-1 text-sm text-slate-600">Upload the fully signed MOU and the completed consent document. Files are stored in the existing Supabase Storage bucket <code>agreements</code>, under a folder linked to this lead ID. Uploading does not create a signature or imply that a document has been verified.</p></div>
-              {([['signedMouFile','Signed MOU copy','PDF, JPG or PNG · maximum 15 MB'],['signedConsentFile','Signed consent copy','PDF, JPG or PNG · maximum 15 MB']] as const).map(([key,label,hint]) => {
-                const record = stage4[key];
-                return <div key={key} className="rounded-xl border border-blue-100 bg-white p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-bold text-slate-800">{label}</p><p className="mt-1 text-xs text-slate-500">{hint}</p>{record?.fileName && <p className="mt-2 break-all text-xs font-semibold text-emerald-700">Uploaded: {record.fileName} · {record.uploadedAt ? new Date(record.uploadedAt).toLocaleString() : ''}</p>}</div><div className="flex flex-wrap items-center gap-2">{record?.path && <button type="button" onClick={()=>openStage4Document(key)} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold">View uploaded file</button>}<label className="cursor-pointer rounded-lg bg-blue-700 px-3 py-2 text-xs font-bold text-white hover:bg-blue-800">{uploadingStage4Doc === key ? 'Uploading…' : record?.path ? 'Upload replacement' : 'Choose file'}<input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" disabled={uploadingStage4Doc !== null} className="hidden" onChange={e=>{const file=e.currentTarget.files?.[0];void uploadStage4Document(key,file);e.currentTarget.value='';}} /></label></div></div></div>;
-              })}
-              <p className="text-xs text-slate-500">Document references are saved with this lead’s Stage 4 record. Make sure the <code>agreements</code> bucket has appropriate authenticated upload and read policies.</p>
-            </div>
-            <button type="button" onClick={activatePartner} disabled={stage4.lifecycle !== 'Onboarding' && stage4.lifecycle !== 'Active'} className="rounded-xl bg-emerald-600 px-5 py-3 text-sm font-black text-white disabled:opacity-40">{stage4.activatedAt ? 'Update / Reconfirm Master Record' : 'Activate Partner & Create Master Record'}</button><p className="text-xs text-slate-500">Activation requires Stage 3 approval and signature records. The master record is upserted by original lead ID to prevent duplicates; activation is not based on an interested reply alone.</p></div>
+            </div><button type="button" onClick={activatePartner} disabled={stage4.lifecycle !== 'Onboarding' && stage4.lifecycle !== 'Active'} className="rounded-xl bg-emerald-600 px-5 py-3 text-sm font-black text-white disabled:opacity-40">{stage4.activatedAt ? 'Update / Reconfirm Master Record' : 'Activate Partner & Create Master Record'}</button><p className="text-xs text-slate-500">Activation requires Stage 3 approval and signature records. The master record is upserted by original lead ID to prevent duplicates; activation is not based on an interested reply alone.</p></div>
             <div className="border-t border-slate-100 pt-6 space-y-4"><h4 className="font-black text-slate-900">Feature 11 · Monitor partnership and renew</h4><div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <label className="block"><span className="text-xs font-bold text-slate-500">Contract expiry date</span><input type="date" value={stage4.contractExpiryDate} onChange={e=>updateStage4Field('contractExpiryDate',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm"/></label>
               <label className="block"><span className="text-xs font-bold text-slate-500">Renewal reminder date</span><input type="date" value={stage4.renewalReminderDate} onChange={e=>updateStage4Field('renewalReminderDate',e.target.value)} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm"/></label>

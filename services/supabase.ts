@@ -1525,32 +1525,14 @@ export const assignTransportToArrival = async (arrivalId: string, transportId: s
 };
 
 // ============================================
-// AGREEMENTS / MOU BUILDER
+// AGREEMENTS
 // ============================================
-
-/**
- * Agreement records used by the MOU builder.
- *
- * The MOU builder stores the rendered HTML in document_content and the
- * generated PDF's Storage path in pdf_path. Run the accompanying SQL migration
- * before using these optional columns in an existing database.
- */
-export type AgreementPayload = {
-  partner_name: string;
-  type: string;
-  status?: string | null;
-  valid_until?: string | null;
-  version?: string | null;
-  partner_category?: string | null;
-  document_content?: string | null;
-  pdf_path?: string | null;
-};
 
 export const fetchAgreements = async () => {
   const { data, error } = await supabase
     .from('agreements')
     .select('*')
-    .order('created_at', { ascending: false });
+    .order('valid_until', { ascending: true });
 
   if (error) {
     console.error('Error fetching agreements:', error);
@@ -1558,95 +1540,214 @@ export const fetchAgreements = async () => {
   return { data, error };
 };
 
-export const createAgreement = async (agreement: AgreementPayload) => {
-  const payload = {
-    partner_name: agreement.partner_name.trim(),
-    type: agreement.type?.trim() || 'MOU',
-    status: agreement.status ?? 'Draft',
-    valid_until: agreement.valid_until || null,
-    version: agreement.version || 'v1.0',
-    partner_category: agreement.partner_category ?? null,
-    document_content: agreement.document_content ?? null,
-    pdf_path: agreement.pdf_path ?? null,
-  };
-
+// Keep this payload aligned with the current public.agreements table:
+// id, partner_name, type, status, valid_until, version, created_at, and optional pdf_path.
+export const createAgreement = async (agreement: {
+  partner_name: string;
+  type: string;
+  status?: string | null;
+  valid_until?: string | null;
+  version?: string | null;
+  pdf_path?: string | null;
+  signed_mou_path?: string | null;
+}) => {
   const { data, error } = await supabase
     .from('agreements')
-    .insert(payload as any)
-    .select('*')
+    .insert(agreement as any)
+    .select()
     .single();
-
   if (error) console.error('Could not create agreement:', error);
   return { data, error };
 };
 
-export const updateAgreement = async (
-  id: string,
-  agreement: Partial<AgreementPayload>,
-) => {
-  const payload: Record<string, unknown> = { ...agreement };
 
-  if (typeof agreement.partner_name === 'string') {
-    payload.partner_name = agreement.partner_name.trim();
-  }
-  if (typeof agreement.type === 'string') {
-    payload.type = agreement.type.trim() || 'MOU';
-  }
-
-  const { data, error } = await supabase
-    .from('agreements')
-    .update(payload as any)
-    .eq('id', id)
-    .select('*')
-    .single();
-
-  if (error) console.error('Could not update agreement:', error);
-  return { data, error };
-};
-
-/**
- * Upload a generated MOU PDF to the private `agreements` Storage bucket.
- * Returns the Storage path so it can be saved in public.agreements.pdf_path.
+/** Upload an agreement PDF to the private `agreements` Storage bucket.
+ * The returned path is stable per agreement and can be stored in the DB if
+ * an agreement document_path column exists.
  */
 export const uploadAgreementPdf = async (
   agreementId: string,
   pdfBlob: Blob,
-  documentType = 'MOU',
-  partnerName = 'partner',
+  documentType: string,
+  partnerName: string,
 ) => {
   const safeSegment = (value: string, fallback: string) =>
-    value.trim()
-      .replace(/[^a-zA-Z0-9_-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 80) || fallback;
-
-  const fileName = `${safeSegment(partnerName, 'partner')}-${safeSegment(documentType, 'MOU')}.pdf`;
+    value.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || fallback;
+  const fileName = `${safeSegment(partnerName, 'partner')}-${safeSegment(documentType, 'agreement')}.pdf`;
   const filePath = `${agreementId}/${fileName}`;
-
   const { data, error } = await supabase.storage
     .from('agreements')
-    .upload(filePath, pdfBlob, {
+    .upload(filePath, pdfBlob, { contentType: 'application/pdf', upsert: true, cacheControl: '3600' });
+  if (error) {
+    console.error('Agreement PDF upload failed:', error);
+    return { data: null, error, filePath: null as string | null };
+  }
+  return { data, error: null, filePath };
+};
+
+/** Create a short-lived URL for viewing a private agreement PDF. */
+export const getAgreementPdfUrl = async (filePath: string) => {
+  const { data, error } = await supabase.storage
+    .from('agreements')
+    .createSignedUrl(filePath, 60 * 10);
+  return { data: data?.signedUrl ?? null, error };
+};
+
+/**
+ * Upload the final, signed MOU PDF to the private `signedmou` bucket.
+ * Draft/generated agreement PDFs continue to use the separate `agreements` bucket.
+ * The returned filePath should be saved in agreements.signed_mou_path.
+ */
+export const uploadSignedMou = async (
+  agreementId: string,
+  file: File,
+  partnerName = 'partner',
+) => {
+  const normalizedId = String(agreementId ?? '').trim();
+  if (!normalizedId) {
+    return { data: null, error: new Error('Agreement ID is required.'), filePath: null as string | null };
+  }
+  if (!(file instanceof File) || file.size <= 0) {
+    return { data: null, error: new Error('Please select a valid signed MOU PDF.'), filePath: null as string | null };
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    return { data: null, error: new Error('Signed MOU must be 20 MB or smaller.'), filePath: null as string | null };
+  }
+  if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+    return { data: null, error: new Error('Only PDF files are allowed for signed MOUs.'), filePath: null as string | null };
+  }
+  if (!file.name.toLowerCase().endsWith('.pdf')) {
+    return { data: null, error: new Error('The selected file must have a .pdf extension.'), filePath: null as string | null };
+  }
+
+  // Confirm the file begins with a PDF signature instead of trusting its name.
+  const header = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+  if (header.length < 5 || header[0] !== 0x25 || header[1] !== 0x50 || header[2] !== 0x44 || header[3] !== 0x46 || header[4] !== 0x2d) {
+    return { data: null, error: new Error('The selected file is not a valid PDF.'), filePath: null as string | null };
+  }
+
+  const safePartner = String(partnerName || 'partner')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'partner';
+  const filePath = `${normalizedId}/${safePartner}-signed-MOU-${Date.now()}.pdf`;
+
+  const { data, error } = await supabase.storage
+    .from('signedmou')
+    .upload(filePath, file, {
       contentType: 'application/pdf',
-      upsert: true,
+      upsert: false,
       cacheControl: '3600',
     });
 
   if (error) {
-    console.error('Agreement PDF upload failed:', error);
+    console.error('[signedmou] Upload failed:', error);
     return { data: null, error, filePath: null as string | null };
   }
 
   return { data, error: null, filePath };
 };
 
-/** Create a short-lived URL for viewing or downloading a private MOU PDF. */
-export const getAgreementPdfUrl = async (filePath: string) => {
-  const { data, error } = await supabase.storage
-    .from('agreements')
-    .createSignedUrl(filePath, 60 * 10);
+/**
+ * Upload the final signed Consent Letter PDF to the same private signed-document
+ * bucket. It is stored in a separate folder beneath the original medical lead ID.
+ */
+export const uploadSignedConsentLetter = async (
+  leadId: string,
+  file: File,
+  partnerName = 'partner',
+) => {
+  const normalizedId = String(leadId ?? '').trim();
+  if (!normalizedId) return { data: null, error: new Error('Lead ID is required.'), filePath: null as string | null };
+  if (!(file instanceof File) || file.size <= 0) return { data: null, error: new Error('Please select a valid signed Consent Letter PDF.'), filePath: null as string | null };
+  if (file.size > 20 * 1024 * 1024) return { data: null, error: new Error('Signed Consent Letter must be 20 MB or smaller.'), filePath: null as string | null };
+  if (!file.name.toLowerCase().endsWith('.pdf') || (file.type && file.type !== 'application/pdf')) {
+    return { data: null, error: new Error('Only PDF files are allowed for signed Consent Letters.'), filePath: null as string | null };
+  }
+  const header = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+  if (header.length < 5 || header[0] !== 0x25 || header[1] !== 0x50 || header[2] !== 0x44 || header[3] !== 0x46 || header[4] !== 0x2d) {
+    return { data: null, error: new Error('The selected file is not a valid PDF.'), filePath: null as string | null };
+  }
+  const safePartner = String(partnerName || 'partner').trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'partner';
+  const filePath = `${normalizedId}/consent/${safePartner}-signed-Consent-Letter-${Date.now()}.pdf`;
+  const { data, error } = await supabase.storage.from('signedmou').upload(filePath, file, {
+    contentType: 'application/pdf', upsert: false, cacheControl: '3600',
+  });
+  if (error) {
+    console.error('[signedmou] Signed Consent Letter upload failed:', error);
+    return { data: null, error, filePath: null as string | null };
+  }
+  return { data, error: null, filePath };
+};
 
-  if (error) console.error('Could not create agreement PDF URL:', error);
+/** Persist a signed document Storage path on the originating medical lead.
+ * Requires signed_mou_path and signed_consent_path columns on public.medical_leads.
+ */
+export const saveMedicalLeadSignedDocumentPath = async (
+  leadId: string,
+  kind: 'MOU' | 'CONSENT',
+  filePath: string,
+) => {
+  const id = String(leadId ?? '').trim();
+  const path = String(filePath ?? '').trim();
+  if (!id || !path) return { data: null, error: new Error('Lead ID and document path are required.') };
+  const column = kind === 'MOU' ? 'signed_mou_path' : 'signed_consent_path';
+  const { data, error } = await supabase
+    .from('medical_leads')
+    .update({ [column]: path } as any)
+    .eq('id', id)
+    .select('id')
+    .single();
+  if (error) console.error(`[medical_leads] Could not save signed ${kind} path:`, error);
+  return { data, error };
+};
+
+/** Create a short-lived signed URL for a private signed MOU or Consent Letter PDF. */
+export const getSignedMouUrl = async (filePath: string) => {
+  const normalizedPath = String(filePath ?? '').trim();
+  if (!normalizedPath) return { data: null, error: new Error('Signed MOU file path is required.') };
+  const { data, error } = await supabase.storage
+    .from('signedmou')
+    .createSignedUrl(normalizedPath, 60 * 10);
   return { data: data?.signedUrl ?? null, error };
+};
+
+/** Delete a signed MOU object from the private `signedmou` bucket. */
+export const deleteSignedMou = async (filePath: string) => {
+  const normalizedPath = String(filePath ?? '').trim();
+  if (!normalizedPath) return { error: new Error('Signed MOU file path is required.') };
+  const { error } = await supabase.storage.from('signedmou').remove([normalizedPath]);
+  if (error) console.error('[signedmou] Delete failed:', error);
+  return { error };
+};
+
+/** Persist the signed MOU Storage path against its agreement record. */
+export const saveSignedMouPath = async (agreementId: string, filePath: string) => {
+  const id = String(agreementId ?? '').trim();
+  const path = String(filePath ?? '').trim();
+  if (!id || !path) return { data: null, error: new Error('Agreement ID and signed MOU path are required.') };
+
+  // `as any` keeps this service compatible with projects whose generated
+  // Supabase Database type has not yet been regenerated for signed_mou_path.
+  const { data, error } = await supabase
+    .from('agreements')
+    .update({ signed_mou_path: path } as any)
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) console.error('[signedmou] Could not save Storage path:', error);
+  return { data, error };
+};
+
+export const updateAgreement = async (id: string, agreement: UpdateTables<'agreements'>) => {
+  const { data, error } = await supabase
+    .from('agreements')
+    .update(agreement)
+    .eq('id', id)
+    .select()
+    .single();
+  return { data, error };
 };
 
 // ============================================

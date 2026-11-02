@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchB2BLeads, createB2BLead, sendCrmEmail, uploadSignedMou, uploadSignedConsentLetter, getSignedMouUrl, saveMedicalLeadSignedDocumentPath } from '../services/supabase.ts';
+import { fetchB2BLeads, createB2BLead, fetchMedicalLeadAgreements, getAgreementPdfUrl, sendCrmEmail, uploadSignedMou, uploadSignedConsentLetter, getSignedMouUrl, saveMedicalLeadSignedDocumentPath } from '../services/supabase.ts';
 import * as XLSX from 'xlsx';
 import { LeadStatus } from '../types.ts';
 import { 
@@ -394,6 +394,8 @@ const Leads: React.FC = () => {
       catch { return { stage: 1, checks: {} }; }
     };
     const [activeStage, setActiveStage] = useState(() => readState().stage);
+    const [stage3Agreements, setStage3Agreements] = useState<any[]>([]);
+    const [stage3AgreementsLoading, setStage3AgreementsLoading] = useState(false);
     const archiveStorageKey = `medical-lead-archive-${lead.id}`;
     const readArchiveState = () => { try { return JSON.parse(localStorage.getItem(archiveStorageKey) || '{}'); } catch { return {}; } };
     const [archiveState, setArchiveState] = useState<any>(() => readArchiveState());
@@ -433,6 +435,24 @@ const Leads: React.FC = () => {
       catch { return defaults; }
     };
     const [stage3, setStage3] = useState<any>(() => readStage3());
+
+    useEffect(() => {
+      let cancelled = false;
+      const loadStage3Agreements = async () => {
+        setStage3AgreementsLoading(true);
+        const { data, error } = await fetchMedicalLeadAgreements(String(lead.id));
+        if (cancelled) return;
+        if (error) {
+          console.error('[Medical Leads] Could not load linked MOUs:', error);
+          setStage3Agreements([]);
+        } else {
+          setStage3Agreements(data || []);
+        }
+        setStage3AgreementsLoading(false);
+      };
+      void loadStage3Agreements();
+      return () => { cancelled = true; };
+    }, [lead.id]);
     const stage4StorageKey = `medical-lead-stage4-${lead.id}`;
     const masterPartnerStorageKey = 'healthhub-medical-partner-master-records';
     const readStage4 = () => {
@@ -548,6 +568,18 @@ const Leads: React.FC = () => {
       saveStage4({ lastSavedAt: record.updatedAt }, 'Partner monitoring and audit record saved.');
     };
     const updateStage3Field = (field: string, value: any) => saveStage3({ [field]: value, approvedToSend: ['templateType','region','templateVersion','legalName','scope','responsibilities','commercialTerms','confidentiality','duration','termination','signatory','nonStandardTerms'].includes(field) ? false : stage3.approvedToSend });
+
+    const openGeneratedMou = async (filePath: string) => {
+      try {
+        const { data, error } = await getAgreementPdfUrl(filePath);
+        if (error) throw error;
+        if (!data) throw new Error('Supabase did not return a document URL.');
+        window.open(data, '_blank', 'noopener,noreferrer');
+      } catch (error: any) {
+        console.error('[Medical Leads] Could not open generated MOU:', error);
+        toast.error(error?.message || 'Could not open the generated MOU.');
+      }
+    };
     const stage3DraftReady = Boolean(stage3.legalName.trim() && stage3.scope.trim() && stage3.responsibilities.trim() && stage3.commercialTerms.trim() && stage3.confidentiality.trim() && stage3.duration.trim() && stage3.termination.trim() && stage3.signatory.trim() && stage3.templateVersion.trim() && stage3.author.trim());
     const stage3ApprovalReady = stage3DraftReady && (!stage3.nonStandardTerms || (stage3.templateLegalReviewed && stage3.legalApproved)) && stage3.managerApproved;
     const makeConsentLetterText = () => [
@@ -763,6 +795,32 @@ const Leads: React.FC = () => {
         {activeStage === 3 && (
           <section className="bg-white border border-slate-200 rounded-[2rem] p-5 md:p-7 shadow-sm space-y-7">
             <div><p className="text-[10px] font-black uppercase tracking-widest text-indigo-600">Stage 3 · BDM / Legal / Manager</p><h3 className="text-xl font-black text-slate-900 mt-1">Contracting & Partner Outreach</h3><p className="text-sm text-slate-500 mt-1">Create and manage MoUs and Consent Letters in the Agreement and Consent Center. Use this stage for review records, partner follow-up, negotiation, and relationship tracking.</p><div className="mt-4 rounded-2xl border border-indigo-100 bg-indigo-50 p-5"><h4 className="font-black text-indigo-950">Agreement and Consent Center</h4><p className="mt-1 text-sm text-indigo-800">Create and manage MoUs and Consent Letters in the central document modules. Stage 3 no longer generates document drafts.</p><div className="mt-4 flex flex-wrap gap-3"><button type="button" onClick={()=>{const categoryMap:Record<string,string>={'Hospital':'Hospital','Doctor':'Hospital','Visa Facilitator':'Visa Facilitators','Visa Facilitators':'Visa Facilitators','Nursing Facilitator':'Nursing Facilitators','Nursing Facilitators':'Nursing Facilitators','Travel Partner':'Travel Partners','Travel Partners':'Travel Partners'};const handoff={sourceLeadId:String(lead.id),documentKind:'MOU',partnerName:String(stage3.legalName||lead.company_name||lead.full_name||''),partnerCategory:categoryMap[String(qualification.category||lead.partner_type||'Hospital')]||'Hospital',partnerAddress:String(lead.address||lead.city||''),partnerCountry:String(lead.country||'India'),representativeName:String(lead.full_name||''),representativeDesignation:String(lead.job_title||lead.designation||''),representativeEmail:String(lead.email||''),representativePhone:String(lead.phone||''),executionCity:[lead.city,lead.country].filter(Boolean).join(', '),registrationNumber:String(lead.registration_number||lead.license_number||''),version:String(stage3.templateVersion||'v1.0')};localStorage.setItem('healthhub-agreement-prefill',JSON.stringify(handoff));window.location.hash='#/agreements';}} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-black text-white hover:bg-indigo-700"><FileText size={16}/> Create MoU for this Lead</button><button type="button" onClick={()=>{const categoryMap:Record<string,string>={'Hospital':'Hospital','Doctor':'Hospital','Visa Facilitator':'Visa Facilitators','Visa Facilitators':'Visa Facilitators','Nursing Facilitator':'Nursing Facilitators','Nursing Facilitators':'Nursing Facilitators','Travel Partner':'Travel Partners','Travel Partners':'Travel Partners'};const handoff={sourceLeadId:String(lead.id),documentKind:'Consent Letter',partnerName:String(stage3.legalName||lead.company_name||lead.full_name||''),partnerCategory:categoryMap[String(qualification.category||lead.partner_type||'Hospital')]||'Hospital',partnerAddress:String(lead.address||lead.city||''),partnerCountry:String(lead.country||'India'),representativeName:String(lead.full_name||''),representativeDesignation:String(lead.job_title||lead.designation||''),representativeEmail:String(lead.email||''),representativePhone:String(lead.phone||''),executionCity:[lead.city,lead.country].filter(Boolean).join(', '),registrationNumber:String(lead.registration_number||lead.license_number||''),version:String(stage3.templateVersion||'v1.0')};localStorage.setItem('healthhub-agreement-prefill',JSON.stringify(handoff));window.location.hash='#/consent';}} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-3 text-sm font-black text-white hover:bg-emerald-700"><ShieldCheck size={16}/> Create Consent for this Lead</button></div><p className="mt-3 text-xs text-indigo-800">Opening these centers does not itself create, send, approve, or sign a document.</p></div></div>
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50/50 p-5 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div><h4 className="font-black text-emerald-950">Generated MoUs for this lead</h4><p className="text-xs text-emerald-800 mt-1">Draft PDFs saved in the private agreements bucket.</p></div>
+                <span className="rounded-full bg-white px-3 py-1 text-xs font-black text-emerald-800">{stage3Agreements.length}</span>
+              </div>
+              {stage3AgreementsLoading ? (
+                <p className="text-sm text-slate-500">Loading linked agreements…</p>
+              ) : stage3Agreements.length ? (
+                <div className="space-y-2">
+                  {stage3Agreements.map((agreement: any) => (
+                    <div key={agreement.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-emerald-100 bg-white p-3">
+                      <div className="min-w-0">
+                        <p className="font-bold text-sm text-slate-900 truncate">{agreement.partner_name || 'Memorandum of Understanding'}</p>
+                        <p className="text-xs text-slate-500">Version {agreement.version || 'v1.0'} · {agreement.status || 'Draft'} · {agreement.created_at ? new Date(agreement.created_at).toLocaleDateString() : 'Date unavailable'}</p>
+                        <p className="text-[11px] text-slate-400 break-all">{agreement.pdf_path || 'PDF path not saved'}</p>
+                      </div>
+                      {agreement.pdf_path ? (
+                        <button type="button" onClick={() => openGeneratedMou(agreement.pdf_path)} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 py-2 text-xs font-black text-white hover:bg-emerald-800"><FileText size={14}/> View MOU</button>
+                      ) : <span className="text-xs font-bold text-amber-700">PDF not uploaded</span>}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-600">No generated MOU is linked to this lead yet. Use “Create MoU for this Lead”; after saving in the Agreement Center, return here to see it.</p>
+              )}
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">MoU Draft</p><p className="mt-1 text-sm font-bold">{stage3DraftReady ? 'Fields complete' : 'Draft incomplete'}</p></div><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">Approval Gate</p><p className="mt-1 text-sm font-bold">{stage3ApprovalReady ? 'Approved to send' : 'Review required'}</p></div><div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-black text-slate-500">Contact</p><p className="mt-1 text-sm font-bold break-words">{lead.email || 'No primary email'}</p></div></div>
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><p className="text-sm font-black text-slate-900">Document preparation moved</p><p className="mt-1 text-sm text-slate-600">MoU template fields, MoU preview, Consent Letter draft preview, and draft downloads have been removed from this stage. Use the Agreement Center and Consent Center above to prepare documents.</p></div>
             <div className="border-t border-slate-100 pt-6 space-y-4"><h4 className="font-black text-slate-900">Stage 3 review and authorisation record</h4><label className="block"><span className="text-xs font-bold text-slate-500">Draft author / BDM *</span><input value={stage3.author} onChange={e=>updateStage3Field('author',e.target.value)} placeholder="Name of responsible BDM" className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-3 text-sm"/></label><div className="grid md:grid-cols-2 gap-3"><label className="flex gap-3 rounded-xl border border-slate-200 p-4 text-sm"><input type="checkbox" checked={stage3.managerApproved} onChange={e=>updateStage3Field('managerApproved',e.target.checked)} className="mt-1"/><span><strong>Manager approval</strong><br/>Manager confirms this version may proceed.</span></label><label className="flex gap-3 rounded-xl border border-slate-200 p-4 text-sm"><input type="checkbox" checked={stage3.legalApproved} onChange={e=>updateStage3Field('legalApproved',e.target.checked)} className="mt-1"/><span><strong>Legal approval</strong><br/>Legal has reviewed this draft and its terms.</span></label><label className="flex gap-3 rounded-xl border border-slate-200 p-4 text-sm md:col-span-2"><input type="checkbox" checked={stage3.templateLegalReviewed} onChange={e=>updateStage3Field('templateLegalReviewed',e.target.checked)} className="mt-1"/><span><strong>Legal review of new/edited template</strong><br/>Required for non-standard terms or any new/edited template.</span></label></div><p className="text-xs text-slate-500">Manager/legal review checks are retained as workflow records. Create and approve the actual document in the Agreement Center. This is not an electronic signature.</p></div>

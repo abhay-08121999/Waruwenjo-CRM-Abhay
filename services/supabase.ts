@@ -1540,6 +1540,19 @@ export const fetchAgreements = async () => {
   return { data, error };
 };
 
+/** Fetch generated agreement documents linked to one Medical Lead. */
+export const fetchMedicalLeadAgreements = async (leadId: string) => {
+  const normalizedLeadId = String(leadId || '').trim();
+  if (!normalizedLeadId) return { data: [], error: new Error('Medical Lead ID is required.') };
+  const { data, error } = await supabase
+    .from('agreements')
+    .select('*')
+    .eq('source_lead_id', normalizedLeadId)
+    .order('created_at', { ascending: false });
+  if (error) console.error('[agreements] Could not fetch Medical Lead agreements:', error);
+  return { data, error };
+};
+
 // Keep this payload aligned with the current public.agreements table:
 // id, partner_name, type, status, valid_until, version, created_at, and optional pdf_path.
 export const createAgreement = async (agreement: {
@@ -1550,6 +1563,7 @@ export const createAgreement = async (agreement: {
   version?: string | null;
   pdf_path?: string | null;
   signed_mou_path?: string | null;
+  source_lead_id?: string | null;
 }) => {
   const { data, error } = await supabase
     .from('agreements')
